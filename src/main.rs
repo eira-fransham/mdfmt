@@ -1,12 +1,13 @@
-#![feature(proc_macro_hygiene)]
+#![feature(proc_macro_hygiene, or_patterns)]
 
 use auto_enums::auto_enum;
 use itertools::Itertools;
-use pulldown_cmark::{CodeBlockKind, CowStr, Event, Tag};
+use pulldown_cmark::{CodeBlockKind, CowStr, Event, LinkType, Parser, Tag};
 use std::{
     borrow::Cow,
+    collections::HashMap,
     fmt::{self, Write as _},
-    io, iter, mem,
+    fs, io, iter, mem,
     path::PathBuf,
 };
 use structopt::StructOpt;
@@ -36,11 +37,15 @@ pub struct Options {
 fn tag_open(tag: &Tag) -> Option<Cow<'static, str>> {
     match tag {
         Tag::CodeBlock(CodeBlockKind::Fenced(language)) => Some(format!("```{}", language).into()),
+        Tag::Item | Tag::Link(..) | Tag::Emphasis | Tag::Strikethrough | Tag::Strong => {
+            unreachable!()
+        }
+        Tag::List(_) => None,
         Tag::CodeBlock(CodeBlockKind::Indented)
         | Tag::BlockQuote
         | Tag::Paragraph
         | Tag::Heading(_) => None,
-        _ => unimplemented!(),
+        other => unimplemented!("{:?}", other),
     }
 }
 
@@ -48,10 +53,12 @@ fn tag_close(tag: &Tag) -> Cow<'static, str> {
     match tag {
         Tag::CodeBlock(CodeBlockKind::Fenced(_)) => format!("```").into(),
         Tag::CodeBlock(CodeBlockKind::Indented)
+        | Tag::Item
+        | Tag::List(_)
         | Tag::BlockQuote
         | Tag::Paragraph
         | Tag::Heading(_) => "".into(),
-        _ => unimplemented!(),
+        other => unimplemented!("{:?}", other),
     }
 }
 
@@ -60,11 +67,13 @@ fn tag_line_start(tag: &Tag) -> Cow<'static, str> {
     match tag {
         Tag::BlockQuote => "> ".into(),
         Tag::Paragraph => "".into(),
+        Tag::List(_) => "".into(),
+        Tag::Item => "  ".into(),
         Tag::CodeBlock(CodeBlockKind::Fenced(_)) => "".into(),
         Tag::CodeBlock(CodeBlockKind::Indented) => "    ".into(),
         // TODO: Allow non-ATX headings
         Tag::Heading(level) => match level {
-            0 => unimplemented!(),
+            0 => unreachable!(),
             1 => "# ".into(),
             2 => "## ".into(),
             3 => "### ".into(),
@@ -77,13 +86,16 @@ fn tag_line_start(tag: &Tag) -> Cow<'static, str> {
                 .collect::<String>()
                 .into(),
         },
-        _ => unimplemented!(),
+        other => unimplemented!("{:?}", other),
     }
 }
 
-pub fn format<'a, I: IntoIterator<Item = Event<'a>> + 'a>(
+pub fn format<'a, 'b: 'a, I: IntoIterator<Item = Event<'a>> + 'a>(
     iter: I,
-    options: &'a Options,
+    width: usize,
+    min_width: usize,
+    break_long_words: bool,
+    links_to_emit: &'b mut HashMap<String, String>,
 ) -> impl Iterator<Item = Event<'a>> + 'a {
     let mut text_buffer: Option<String> = None;
     let mut indent = 0;
@@ -91,8 +103,11 @@ pub fn format<'a, I: IntoIterator<Item = Event<'a>> + 'a>(
 
     let wrap_text_buffer = move |text_buffer: Option<String>, indent: usize| {
         text_buffer.into_iter().flat_map(move |buf| {
-            let vec = Wrapper::new(options.width.saturating_sub(indent).max(options.min_width))
-                .wrap_iter(&buf)
+            let mut wrapper = Wrapper::new(width.saturating_sub(indent).max(min_width));
+            wrapper.break_words = break_long_words;
+
+            let vec = wrapper
+                .into_wrap_iter(&buf)
                 .map(|i| i.to_string())
                 .collect::<Vec<String>>();
 
@@ -112,14 +127,84 @@ pub fn format<'a, I: IntoIterator<Item = Event<'a>> + 'a>(
         }
 
         match ev {
-            Event::Start(tag) => {
-                if let Tag::CodeBlock(_) = tag {
-                    assert!(!is_code_section);
-                    is_code_section = true;
+            Event::Start(Tag::Link(linktype, target, _)) => {
+                if let LinkType::Reference(rname) = linktype {
+                    links_to_emit.insert(rname.to_string(), target.to_string());
                 }
 
+                match &mut text_buffer {
+                    Some(buf) => buf.push_str("["),
+                    None => text_buffer = Some("[".to_string()),
+                }
+
+                Box::new(iter::empty())
+            }
+            Event::Start(Tag::Emphasis) => {
+                match &mut text_buffer {
+                    Some(buf) => buf.push_str("_"),
+                    None => text_buffer = Some("_".to_string()),
+                }
+
+                Box::new(iter::empty())
+            }
+            Event::Start(Tag::Strong) => {
+                match &mut text_buffer {
+                    Some(buf) => buf.push_str("**"),
+                    None => text_buffer = Some("**".to_string()),
+                }
+
+                Box::new(iter::empty())
+            }
+            Event::Start(tag) => {
+                let text_iter = match &tag {
+                    Tag::CodeBlock(_) => {
+                        assert!(!is_code_section);
+                        is_code_section = true;
+
+                        Some(
+                            wrap_text_buffer(text_buffer.take(), indent)
+                                .chain(Some(Event::SoftBreak)),
+                        )
+                        .into_iter()
+                        .flatten()
+                    }
+                    Tag::List(_) => Some(wrap_text_buffer(text_buffer.take(), indent).chain(None))
+                        .into_iter()
+                        .flatten(),
+                    _ => None.into_iter().flatten(),
+                };
+
                 indent += tag_line_start(&tag).len();
-                Box::new(iter::once(Event::Start(tag)))
+
+                Box::new(text_iter.chain(iter::once(Event::Start(tag))))
+            }
+            Event::End(Tag::Link(LinkType::Reference(rname), target, title)) => {
+                match &mut text_buffer {
+                    Some(buf) => {
+                        buf.push_str("][");
+                        buf.push_str(&*rname);
+                        buf.push_str("]");
+                    }
+                    None => text_buffer = Some(format!("][{}]", rname)),
+                }
+
+                Box::new(iter::empty())
+            }
+            Event::End(Tag::Emphasis) => {
+                match &mut text_buffer {
+                    Some(buf) => buf.push_str("_"),
+                    None => text_buffer = Some("_".to_string()),
+                }
+
+                Box::new(iter::empty())
+            }
+            Event::End(Tag::Strong) => {
+                match &mut text_buffer {
+                    Some(buf) => buf.push_str("**"),
+                    None => text_buffer = Some("**".to_string()),
+                }
+
+                Box::new(iter::empty())
             }
             Event::End(tag) => {
                 let new_indent = indent - tag_line_start(&tag).len();
@@ -166,14 +251,16 @@ pub fn format<'a, I: IntoIterator<Item = Event<'a>> + 'a>(
     iter.into_iter().flat_map(map_fn)
 }
 
-pub fn display<'a, I: IntoIterator<Item = Event<'a>> + 'a, W: io::Write>(
+pub fn display<'a, 'b, I: IntoIterator<Item = Event<'a>> + 'a, W: io::Write>(
     iter: I,
-    options: &Options,
-    f: &mut W,
+    width: usize,
+    min_width: usize,
+    f: &'b mut W,
 ) -> io::Result<()> {
     let mut tag_stack = vec![];
     let mut in_end_state = false;
-    let mut has_emitted_newlines = false;
+    let mut has_emitted_newlines = true;
+    let mut emit_softbreak = false;
 
     macro_rules! emit_newlines {
         () => {
@@ -198,32 +285,56 @@ pub fn display<'a, I: IntoIterator<Item = Event<'a>> + 'a, W: io::Write>(
         }
 
         match ev {
-            Event::Start(tag) => {
-                match tag_open(&tag) {
-                    Some(open) => {
-                        for tag in &mut tag_stack {
-                            write!(f, "{}", tag_line_start(&*tag))?;
-                        }
+            Event::Start(Tag::Item) => {
+                let start_num = match tag_stack.pop() {
+                    Some(Tag::List(start_num)) => start_num,
+                    _ => unreachable!(),
+                };
 
-                        writeln!(f, "{}", open)?;
-                    }
-                    None => {}
-                }
+                if !has_emitted_newlines {
+                    writeln!(f)?;
 
-                tag_stack.push(tag);
-
-                if has_emitted_newlines {
                     for tag in &mut tag_stack {
                         write!(f, "{}", tag_line_start(&*tag))?;
                     }
 
-                    has_emitted_newlines = false;
+                    has_emitted_newlines = true;
                 }
+
+                match start_num {
+                    Some(val) => write!(f, "{}. ", val)?,
+                    None => write!(f, "- ")?,
+                }
+
+                tag_stack.push(Tag::List(start_num.map(|i| i + 1)));
+                tag_stack.push(Tag::Item);
+            }
+            Event::Start(tag) => {
+                if emit_softbreak {
+                    if !has_emitted_newlines {
+                        writeln!(f)?;
+
+                        for tag in &mut tag_stack {
+                            write!(f, "{}", tag_line_start(&*tag))?;
+                        }
+                    }
+
+                    emit_softbreak = false;
+                }
+
+                if let Some(open) = tag_open(&tag) {
+                    writeln!(f, "{}", open)?;
+                } else {
+                    write!(f, "{}", tag_line_start(&tag))?;
+                }
+
+                tag_stack.push(tag);
+            }
+            Event::End(Tag::Item) => {
+                tag_stack.pop().unwrap();
             }
             Event::End(tag) => {
-                let top_tag = tag_stack.pop().unwrap();
-
-                assert_eq!(top_tag, tag);
+                tag_stack.pop().unwrap();
 
                 write!(f, "{}", tag_close(&tag))?;
 
@@ -232,19 +343,27 @@ pub fn display<'a, I: IntoIterator<Item = Event<'a>> + 'a, W: io::Write>(
             Event::Text(text) => {
                 has_emitted_newlines = false;
 
+                let text = if text.starts_with("- ") {
+                    write!(f, " -")?;
+                    (&text[2..]).into()
+                } else {
+                    text
+                };
+
+                if emit_softbreak {
+                    writeln!(f)?;
+
+                    for tag in &mut tag_stack {
+                        write!(f, "{}", tag_line_start(&*tag))?;
+                    }
+
+                    emit_softbreak = false;
+                }
+
                 write!(f, "{}", text)?
             }
-            Event::Code(code) => {
-                has_emitted_newlines = false;
-
-                write!(f, "`{}`", code)?
-            }
             Event::SoftBreak => {
-                writeln!(f)?;
-
-                for tag in &mut tag_stack {
-                    write!(f, "{}", tag_line_start(&*tag))?;
-                }
+                emit_softbreak = true;
             }
             Event::HardBreak => emit_newlines!(),
             Event::Rule => {
@@ -256,11 +375,7 @@ pub fn display<'a, I: IntoIterator<Item = Event<'a>> + 'a, W: io::Write>(
                     write!(f, "{}", tag_line_start)?;
                 }
 
-                let num_dashes = options
-                    .width
-                    .saturating_sub(indent)
-                    .max(options.min_width)
-                    .max(3);
+                let num_dashes = width.saturating_sub(indent).max(min_width).max(3);
 
                 for _ in 0..num_dashes {
                     write!(f, "-")?;
@@ -279,14 +394,63 @@ pub fn display<'a, I: IntoIterator<Item = Event<'a>> + 'a, W: io::Write>(
     Ok(())
 }
 
+fn read_write<I: io::Read, O: io::Write>(
+    mut input: I,
+    mut output: O,
+    opts: &Options,
+) -> io::Result<()> {
+    let mut input_string = String::new();
+    input.read_to_string(&mut input_string)?;
+
+    let mut links_to_emit = HashMap::new();
+
+    display(
+        format(
+            Parser::new(&input_string),
+            opts.width,
+            opts.min_width,
+            opts.break_long_words,
+            &mut links_to_emit,
+        ),
+        opts.width,
+        opts.min_width,
+        &mut output,
+    )?;
+
+    let mut sorted_links = links_to_emit.keys().map(|v| &v[..]).collect::<Vec<_>>();
+    sorted_links.sort_unstable();
+
+    if !sorted_links.is_empty() {
+        writeln!(output)?;
+
+        for link in sorted_links {
+            writeln!(output, "[{}]: {}", link, links_to_emit[link])?;
+        }
+    }
+
+    Ok(())
+}
+
 fn main() {
-    println!("Hello, world!");
+    let opts = Options::from_args();
+
+    match (&opts.input, &opts.output) {
+        (Some(i), Some(o)) => read_write(
+            fs::File::open(i).unwrap(),
+            fs::File::open(o).unwrap(),
+            &opts,
+        ),
+        (None, Some(o)) => read_write(io::stdin().lock(), fs::File::open(o).unwrap(), &opts),
+        (Some(i), None) => read_write(fs::File::open(i).unwrap(), io::stdout().lock(), &opts),
+        (None, None) => read_write(io::stdin().lock(), io::stdout().lock(), &opts),
+    }
+    .unwrap()
 }
 
 #[cfg(test)]
 mod test {
     use super::{display, format, Options};
-    use std::iter;
+    use std::{collections::HashMap, iter};
     use structopt::StructOpt;
 
     #[test]
@@ -296,6 +460,7 @@ mod test {
         let parser = Parser::new(
             r#"
 Hello, world, asfkmas asf as faasfkmas asf as faasfkmas asf as faasfkmas asf as faasfkmas asf as faasfkmas asf as fa
+one two three
 
 > Here's a very long quote, asfkmas asf as faasfkmas asf as faasfkmas asf as faasfkmas asf as faasfkmas asf as faasfkmas asf as fa
 > ...but there's more!
@@ -308,7 +473,7 @@ Hello, world, asfkmas asf as faasfkmas asf as faasfkmas asf as faasfkmas asf as 
 ### Heading 3
 #### Really really long heading, asfkmas asf as faasfkmas asf as faasfkmas asf as faasfkmas asf as faasfkmas asf as faasfkmas asf as fa
 
-```
+```test one two three
 Some code! This should not be formatted at all, and should be allowed to be as long as it is in the original text! Don't split me!
 ```
 
@@ -319,6 +484,19 @@ This is a test!
         );
 
         let opts = &Options::from_iter(iter::empty::<std::ffi::OsString>());
-        display(format(parser, opts), opts, &mut std::io::stdout().lock()).unwrap();
+        let mut links_to_emit = HashMap::new();
+        display(
+            format(
+                parser,
+                opts.width,
+                opts.min_width,
+                opts.break_long_words,
+                &mut links_to_emit,
+            ),
+            opts.width,
+            opts.min_width,
+            &mut std::io::stdout().lock(),
+        )
+        .unwrap();
     }
 }
