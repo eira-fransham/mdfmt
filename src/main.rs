@@ -336,6 +336,10 @@ pub fn display<'a, 'b, I: IntoIterator<Item = Event<'a>> + 'a, W: io::Write>(
             Event::End(tag) => {
                 tag_stack.pop().unwrap();
 
+                for tag in &mut tag_stack {
+                    write!(f, "{}", tag_line_start(&*tag))?;
+                }
+
                 write!(f, "{}", tag_close(&tag))?;
 
                 in_end_state = true;
